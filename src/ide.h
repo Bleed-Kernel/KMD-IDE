@@ -25,6 +25,7 @@
 // status bits
 #define ATA_SR_BSY            0x80
 #define ATA_SR_DRDY           0x40
+#define ATA_SR_DF             0x20
 #define ATA_SR_DRQ            0x08
 #define ATA_SR_ERR            0x01
 
@@ -48,6 +49,14 @@
 #define ATAPI_PACKET_LEN      12
 #define ATAPI_BYTE_LIMIT      0xF800
 #define ATAPI_TIMEOUT_MS      5000
+
+#define IDE_READY_TIMEOUT_MS  5000
+#define IDE_DATA_TIMEOUT_MS   10000
+#define IDE_FLUSH_TIMEOUT_MS  30000
+
+// device control register
+#define ATA_CTRL_NIEN         0x02
+#define ATA_CTRL_SRST         0x04
 
 // drive select
 #define ATA_DRIVE_MASTER      0xA0
@@ -82,6 +91,7 @@ typedef struct ide_drive {
     bool     present;
     bool     is_slave;
     bool     atapi;           // a cd drive, 2048 byte blocks shown to everyone else as 512 byte sectors
+    bool     has_flush;       // IDENTIFY says FLUSH CACHE is there, older drives abort it
     uint16_t base;            // I/O base port
     uint16_t ctrl;            // control port 
     uint32_t sector_count;    // total LBA28 sectors

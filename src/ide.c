@@ -19,29 +19,67 @@ static spinlock_t  ide_lock = {0};
 
 static inline void ide_io_wait(void) { wait_ns(400); }
 
-static int ide_poll(uint16_t base) {
+static int ide_wait(uint16_t base, uint8_t want, uint32_t ms, const char *what, uint32_t lba) {
     ide_io_wait();
+    uint64_t deadline = hpet_get_femtoseconds() + (uint64_t)ms * femtosecondsPerMillisecond;
 
-    for (int i = 0; i < 30000; i++) {
+    for (;;) {
         uint8_t status = inb(base + ATA_REG_STATUS);
-        if (status & ATA_SR_ERR) {
-            uint8_t err = inb(base + ATA_REG_ERROR);
-            serial_printf(LOG_ERROR "ide: poll error - status=0x%x err=0x%x\n", status, err);
-            return -1;
+        if (!(status & ATA_SR_BSY)) {
+            if (status & (ATA_SR_ERR | ATA_SR_DF)) {
+                serial_printf(LOG_ERROR "ide: %s lba=%u failed - status=0x%x err=0x%x\n",
+                              what, lba, status, inb(base + ATA_REG_ERROR));
+                return -1;
+            }
+            if ((status & want) == want) return 0;
         }
-        if (!(status & ATA_SR_BSY) && (status & ATA_SR_DRQ)) return 0;
+        if (hpet_get_femtoseconds() > deadline) {
+            serial_printf(LOG_ERROR "ide: %s lba=%u timed out - status=0x%x\n", what, lba, status);
+            return -2;
+        }
     }
-    serial_printf(LOG_ERROR "ide: poll timeout - status=0x%x\n", inb(base + ATA_REG_STATUS));
-    return -2;
 }
 
-static int ide_wait_ready(uint16_t base) {
-    for (int i = 0; i < 100000; i++) {
-        uint8_t s = inb(base + ATA_REG_STATUS);
-        if (s == 0xFF) return -1; // bus is likely empty
-        if (!(s & ATA_SR_BSY) && (s & ATA_SR_DRDY)) return 0;
+static void ide_reset_channel(ide_drive_t *drive) {
+    serial_printf(LOG_WARN "ide: resetting channel 0x%x\n", drive->base);
+    outb(drive->ctrl, ATA_CTRL_SRST | ATA_CTRL_NIEN);
+    wait_ns(10000);
+    outb(drive->ctrl, ATA_CTRL_NIEN);
+    wait_ns(2000000);
+
+    uint64_t deadline = hpet_get_femtoseconds() + (uint64_t)IDE_READY_TIMEOUT_MS * femtosecondsPerMillisecond;
+    while ((inb(drive->base + ATA_REG_STATUS) & ATA_SR_BSY) && hpet_get_femtoseconds() < deadline)
+        ;
+}
+
+static int ide_select(ide_drive_t *drive, uint32_t lba) {
+    uint8_t drive_sel = (drive->is_slave ? ATA_DRIVE_SLAVE : ATA_DRIVE_MASTER)
+                        | ATA_LBA_MODE
+                        | ((lba >> 24) & 0x0F);
+
+    for (int tries = 0; tries < 2; tries++) {
+        outb(drive->base + ATA_REG_DRIVE_HEAD, drive_sel);
+        ide_io_wait();
+
+        uint64_t deadline = hpet_get_femtoseconds() + (uint64_t)IDE_READY_TIMEOUT_MS * femtosecondsPerMillisecond;
+        for (;;) {
+            uint8_t s = inb(drive->base + ATA_REG_STATUS);
+            if (s == 0xFF) return -1; // bus is likely empty
+            if (!(s & ATA_SR_BSY) && (s & ATA_SR_DRDY) && !(s & ATA_SR_DRQ)) return 0;
+            if (!(s & ATA_SR_BSY) && (s & ATA_SR_DRQ)) break;
+            if (hpet_get_femtoseconds() > deadline) break;
+        }
+        ide_reset_channel(drive);
     }
+    serial_printf(LOG_ERROR "ide: drive not ready lba=%u\n", lba);
     return -1;
+}
+
+static void ide_set_lba(ide_drive_t *drive, uint32_t lba, uint8_t count) {
+    outb(drive->base + ATA_REG_SECTOR_COUNT, count);
+    outb(drive->base + ATA_REG_LBA_LO,  (uint8_t)(lba));
+    outb(drive->base + ATA_REG_LBA_MID, (uint8_t)(lba >> 8));
+    outb(drive->base + ATA_REG_LBA_HI,  (uint8_t)(lba >> 16));
 }
 
 // big endian
@@ -262,6 +300,7 @@ static bool ide_identify(uint16_t base, uint16_t ctrl, bool slave, ide_drive_t *
         identify[i] = inw(base + ATA_REG_DATA);
 
     out->sector_count = ((uint32_t)identify[61] << 16) | identify[60];
+    out->has_flush    = (identify[83] & 0xC000) == 0x4000 && (identify[83] & (1 << 12));
     out->base     = base;
     out->ctrl     = ctrl;
     out->is_slave = slave;
@@ -285,32 +324,18 @@ int ide_read_sectors(ide_drive_t *drive, uint32_t lba, uint8_t count, void *buf)
         return r;
     }
 
-    uint8_t drive_sel = (drive->is_slave ? ATA_DRIVE_SLAVE : ATA_DRIVE_MASTER)
-                        | ATA_LBA_MODE
-                        | ((lba >> 24) & 0x0F);
-
-    // we have to wait for the drive to respond first
-    outb(drive->base + ATA_REG_DRIVE_HEAD, drive_sel);
-    ide_io_wait();
-
-    if (ide_wait_ready(drive->base) < 0) {
-        serial_printf(LOG_ERROR "ide: drive not ready for read lba=%u\n", lba);
+    if (ide_select(drive, lba) < 0) {
         spinlock_release(&ide_lock);
         return -1;
     }
 
-    outb(drive->base + ATA_REG_SECTOR_COUNT,  count);
-    outb(drive->base + ATA_REG_LBA_LO,  (uint8_t)(lba));
-    outb(drive->base + ATA_REG_LBA_MID, (uint8_t)(lba >> 8));
-    outb(drive->base + ATA_REG_LBA_HI,  (uint8_t)(lba >> 16));
-    outb(drive->base + ATA_REG_COMMAND,  ATA_CMD_READ_PIO);
-
-    // dummy read
-    inb(drive->base + ATA_REG_STATUS);
+    ide_set_lba(drive, lba, count);
+    outb(drive->base + ATA_REG_COMMAND, ATA_CMD_READ_PIO);
 
     uint16_t *ptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (ide_poll(drive->base) < 0) {
+        if (ide_wait(drive->base, ATA_SR_DRQ, IDE_DATA_TIMEOUT_MS, "read", lba + s) < 0) {
+            ide_reset_channel(drive);
             spinlock_release(&ide_lock);
             return -1;
         }
@@ -328,45 +353,38 @@ int ide_write_sectors(ide_drive_t *drive, uint32_t lba, uint8_t count, const voi
 
     spinlock_acquire(&ide_lock);
 
-    uint8_t drive_sel = (drive->is_slave ? ATA_DRIVE_SLAVE : ATA_DRIVE_MASTER)
-                        | ATA_LBA_MODE
-                        | ((lba >> 24) & 0x0F);
-
-    outb(drive->base + ATA_REG_DRIVE_HEAD, drive_sel);
-    ide_io_wait();
-
-    if (ide_wait_ready(drive->base) < 0) {
-        serial_printf(LOG_ERROR "ide: drive not ready for write lba=%u\n", lba);
+    if (ide_select(drive, lba) < 0) {
         spinlock_release(&ide_lock);
         return -1;
     }
 
-    outb(drive->base + ATA_REG_SECTOR_COUNT,  count);
-    outb(drive->base + ATA_REG_LBA_LO,  (uint8_t)(lba));
-    outb(drive->base + ATA_REG_LBA_MID, (uint8_t)(lba >> 8));
-    outb(drive->base + ATA_REG_LBA_HI,  (uint8_t)(lba >> 16));
-    outb(drive->base + ATA_REG_COMMAND,  ATA_CMD_WRITE_PIO);
-
-    uint8_t st = inb(drive->base + ATA_REG_STATUS);
-    (void)st;
-
-    for (int i = 0; i < 10; i++) inb(drive->ctrl);
+    ide_set_lba(drive, lba, count);
+    outb(drive->base + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO);
 
     const uint16_t *ptr = (const uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (ide_poll(drive->base) < 0) {
-            spinlock_release(&ide_lock);
-            return -1;
-        }
+        if (ide_wait(drive->base, ATA_SR_DRQ, IDE_DATA_TIMEOUT_MS, "write", lba + s) < 0)
+            goto fail;
         for (int w = 0; w < 256; w++)
             outw(drive->base + ATA_REG_DATA, ptr[s * 256 + w]);
     }
 
-    outb(drive->base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
-    ide_poll(drive->base);
+    if (ide_wait(drive->base, 0, IDE_DATA_TIMEOUT_MS, "write", lba + count - 1) < 0)
+        goto fail;
+
+    if (drive->has_flush) {
+        outb(drive->base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
+        if (ide_wait(drive->base, 0, IDE_FLUSH_TIMEOUT_MS, "flush", lba) < 0)
+            goto fail;
+    }
 
     spinlock_release(&ide_lock);
     return 0;
+
+fail:
+    ide_reset_channel(drive);
+    spinlock_release(&ide_lock);
+    return -1;
 }
 
 ide_drive_t *ide_get_drive(int index) {
